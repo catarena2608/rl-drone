@@ -17,7 +17,7 @@ import numpy as np
 from stable_baselines3 import PPO
 
 # Import môi trường Stage 2
-from backup.nav_aviary import Stage2NavAviary
+from nav_aviary import Stage2NavAviary
 
 MODEL_DIR = "./models/stage2"
 

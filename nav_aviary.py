@@ -1,33 +1,63 @@
 """
-STAGE 2 — Navigation & Robust Hovering
+STAGE 2 — Navigation & Robust Hovering với Moving Waypoint Planner
 ===========================================================================
-Bài toán: Di chuyển drone từ vị trí bất kỳ đến TARGET_POS [0, 0, 1.0]
-và hover ổn định tại đó.
+Kiến trúc hybrid 2 tầng:
+    Tầng 1 (WaypointPlanner): toán học thuần túy
+        - Nhận goal_pos (random mỗi episode)
+        - Tạo waypoint di chuyển liên tục về phía goal
+        - Waypoint luôn cách drone tối đa LOOKAHEAD = 0.3m
 
-Obs (19,):
-    pos(3)          — vị trí tuyệt đối, cần thiết để generalize xa
+    Tầng 2 (RL Controller): policy học được
+        - Chỉ thấy rel_waypoint (luôn <= 0.3m) — không bao giờ OOD
+        - Không quan tâm goal ở đâu, chỉ bay đến waypoint
+
+Tại sao giải quyết được generalize và dynamic goal:
+    Generalize:    RL chỉ thấy vector nhỏ <= 0.3m dù goal cách bao xa
+    Dynamic goal:  set_new_goal() bất kỳ lúc nào, waypoint tự update
+
+Obs (19,) — tương thích model cũ:
+    pos(3)          — vị trí tuyệt đối
     rpy(3)          — góc nghiêng thân
     vel(3)          — vận tốc tuyến tính
     ang_vel(3)      — vận tốc góc
-    rel_target(3)   — vector từ drone đến target (hướng đi)
-    dist(1)         — khoảng cách scalar đến target
-    last_act_rpy(3) — 3 motor cuối của action trước (bỏ motor 0 vì redundant)
+    rel_waypoint(3) — vector từ drone đến WAYPOINT (luôn <= 0.3m)
+    dist_wp(1)      — khoảng cách đến waypoint
+    last_act(3)     — 3 motor cuối action trước
 
 Thay đổi so với phiên bản cũ:
-    [obs]     Thêm pos(3) tuyệt đối → 16 chiều lên 19 chiều
-              Agent cần biết mình đang ở đâu trong không gian để generalize
-    [reward]  Thêm trọng số rõ ràng theo thứ bậc ưu tiên
-              Thêm velocity penalty có scale theo khoảng cách (proximity_factor)
-              Xóa r_alive — tránh incentive sai khiến agent ì lại
-              r_nav dùng linear thay vì exponential để gradient không chết ở xa
-    [reset]   Noise theo Z nhỏ hơn noise theo XY (Z khó điều khiển hơn)
-    [obs_space] Cập nhật đúng kích thước 19
+    [planner]  Thêm WaypointPlanner
+    [goal]     TARGET_POS random mỗi episode thay vì cố định [0,0,1]
+    [obs]      rel_target -> rel_waypoint
+    [reward]   dist dùng dist_wp (luôn <= 0.3m, gradient không chết)
+    [info]     Thêm dist_goal, at_goal
+    [bounds]   Nới rộng out_of_bounds vì goal có thể ở xa hơn
 """
 
+import os
 import numpy as np
 from gymnasium import spaces
 from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
+from waypoint_planner import WaypointPlanner
+
+SPAWN_RADIUS_FILE = "./models/stage2/spawn_radius.txt"
+
+# Không gian bay hợp lệ để random goal mỗi episode
+GOAL_X_RANGE = (-2.0,  2.0)
+GOAL_Y_RANGE = (-2.0,  2.0)
+GOAL_Z_RANGE = ( 0.5,  2.0)
+
+
+def _load_spawn_radius(default: float = 0.1) -> float:
+    if os.path.exists(SPAWN_RADIUS_FILE):
+        try:
+            with open(SPAWN_RADIUS_FILE, "r") as f:
+                val = float(f.read().strip())
+            print(f"[NAV_AVIARY] Loaded spawn_radius: {val:.2f} m")
+            return val
+        except ValueError:
+            pass
+    return default
 
 
 class Stage2NavAviary(BaseRLAviary):
@@ -44,14 +74,17 @@ class Stage2NavAviary(BaseRLAviary):
 
         self.TARGET_POS   = np.array([0.0, 0.0, 1.0])
         self.MAX_STEPS    = 2000
-        self.spawn_radius = 0.1
+        self.spawn_radius = _load_spawn_radius(default=0.1)
 
-        # Biến nội bộ — reset đúng trong reset()
         self._step_n      = 0
         self._last_action = np.zeros(4)
         self._prev_action = np.zeros(4)
 
-        # Spawn ban đầu gần target để super().__init__ không bị lỗi
+        # Tầng 1: WaypointPlanner
+        # LOOKAHEAD = 0.3m — bán kính RL controller đã học tốt
+        self.planner = WaypointPlanner(lookahead=0.3, goal_threshold=0.05)
+        self.planner.set_goal(self.TARGET_POS)
+
         if initial_xyzs is None:
             offset = np.random.uniform(-0.1, 0.1, size=(1, 3))
             offset[0, 2] = np.random.uniform(-0.05, 0.05)
@@ -68,29 +101,28 @@ class Stage2NavAviary(BaseRLAviary):
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
-        """
-        Spawn ngẫu nhiên trong spawn_radius.
-        
-        FIX: Noise Z nhỏ hơn noise XY vì:
-        - Trục Z liên quan trực tiếp đến thrust — sai lệch lớn theo Z
-          đòi hỏi agent phải học bù thrust ngay lập tức, rất khó
-        - Trục XY chỉ cần nghiêng thân là di chuyển được, dễ hơn
-        - Tăng dần Z scale theo spawn_radius để curriculum mượt
-        """
         self._step_n      = 0
         self._last_action = np.zeros(4)
         self._prev_action = np.zeros(4)
 
-        r    = self.spawn_radius
-        # XY lấy full radius, Z chỉ lấy 40% radius
-        noise_xy = np.random.uniform(-r,        r,        size=(2,))
-        noise_z  = np.random.uniform(-r * 0.4,  r * 0.4)
+        # Random goal mới mỗi episode
+        self.TARGET_POS = np.array([
+            np.random.uniform(*GOAL_X_RANGE),
+            np.random.uniform(*GOAL_Y_RANGE),
+            np.random.uniform(*GOAL_Z_RANGE),
+        ])
+        self.planner.set_goal(self.TARGET_POS)
+
+        # Spawn quanh goal trong spawn_radius (curriculum vẫn hoạt động)
+        r        = self.spawn_radius
+        noise_xy = np.random.uniform(-r,       r,       size=(2,))
+        noise_z  = np.random.uniform(-r * 0.4, r * 0.4)
 
         initial_xyz    = self.TARGET_POS.copy()
         initial_xyz[0] += noise_xy[0]
         initial_xyz[1] += noise_xy[1]
         initial_xyz[2] += noise_z
-        initial_xyz[2]  = max(initial_xyz[2], 0.15)  # không cho spawn dưới đất
+        initial_xyz[2]  = max(initial_xyz[2], 0.15)
 
         self.INIT_XYZS = np.array([initial_xyz])
         return super().reset(seed=seed, options=options)
@@ -99,14 +131,14 @@ class Stage2NavAviary(BaseRLAviary):
 
     def _observationSpace(self):
         """
-        19 chiều:
-            [0:3]   pos          — vị trí tuyệt đối (x, y, z)
+        19 chiều — tương thích model cũ:
+            [0:3]   pos          — vị trí tuyệt đối
             [3:6]   rpy          — roll, pitch, yaw
             [6:9]   vel          — vx, vy, vz
             [9:12]  ang_vel      — p, q, r
-            [12:15] rel_target   — vector đến target
-            [15]    dist         — khoảng cách scalar
-            [16:19] last_act_rpy — 3 motor cuối của action trước
+            [12:15] rel_waypoint — vector đến waypoint (luôn <= 0.3m)
+            [15]    dist_wp      — khoảng cách đến waypoint
+            [16:19] last_act     — 3 motor cuối action trước
         """
         return spaces.Box(
             low  = np.full(19, -np.inf, dtype=np.float32),
@@ -121,20 +153,21 @@ class Stage2NavAviary(BaseRLAviary):
         vel     = s[10:13]
         ang_vel = s[13:16]
 
-        rel_target = self.TARGET_POS - pos
-        dist       = np.array([np.linalg.norm(rel_target)], dtype=np.float32)
+        # Waypoint từ planner — luôn cách drone tối đa LOOKAHEAD
+        waypoint     = self.planner.update(pos)
+        rel_waypoint = waypoint - pos
+        dist_wp      = float(np.linalg.norm(rel_waypoint))
 
-        # Lấy 3 motor cuối (bỏ motor 0 vì 4 motor có redundancy)
-        last_act_rpy = self._last_action.flatten()[1:]  # shape (3,)
+        last_act = self._last_action.flatten()[1:]  # 3 motor cuối
 
         return np.hstack([
-            pos,           # (3,) — THÊM MỚI: vị trí tuyệt đối
+            pos,           # (3,)
             rpy,           # (3,)
             vel,           # (3,)
             ang_vel,       # (3,)
-            rel_target,    # (3,)
-            dist,          # (1,)
-            last_act_rpy,  # (3,)
+            rel_waypoint,  # (3,) — vector đến waypoint, không phải goal
+            [dist_wp],     # (1,)
+            last_act,      # (3,)
         ]).astype(np.float32)  # tổng 19 chiều
 
     # ── Action hook ───────────────────────────────────────────────────────────
@@ -149,28 +182,13 @@ class Stage2NavAviary(BaseRLAviary):
 
     def _computeReward(self):
         """
-        Reward có trọng số theo thứ bậc ưu tiên:
+        Reward dùng dist_wp (khoảng cách đến waypoint) thay vì dist đến goal.
 
-        TẦNG 1 (w=8.0)  r_nav    — tiếp cận mục tiêu, LINEAR gradient
-                                    không dùng exponential vì gradient chết ở xa
-        TẦNG 2 (w=10.0) r_close  — bonus khi đến rất gần, exponential
-                                    tạo "peak" rõ ràng để agent biết đây là đích
-        TẦNG 3 (w=3.0)  r_vel    — phạt tốc độ, scale theo proximity_factor
-                                    khi xa được bay nhanh, khi gần phải chậm lại
-                                    — đây là điều kiện BẮT BUỘC để hover
-        TẦNG 4 (w=1.5)  r_att    — phạt góc nghiêng, trung bình
-                                    không quá lớn vì agent cần nghiêng để di chuyển
-        TẦNG 5 (w=0.3)  r_act    — phạt action lớn, nhỏ thôi
-                                    nếu lớn hơn r_nav agent sẽ học cách đứng yên
-        TẦNG 6 (w=0.2)  r_angvel — phạt xoay thân, rất nhỏ
-
-        KHÔNG có r_alive:
-            r_alive tạo incentive sai — agent được thưởng chỉ vì tồn tại
-            dù không tiếp cận target, dẫn đến behavior "lơ lửng tại chỗ"
-
-        Kiểm tra magnitude tại các điểm quan trọng:
-            dist=1.5m → r_nav đóng góp -12.0 (dominant) → agent tập trung bay
-            dist=0.05m → r_close đóng góp +6.07 (dominant) → agent tập trung hover
+        dist_wp luôn <= 0.3m nên:
+        - Gradient r_nav không bao giờ chết dù goal xa bao nhiêu
+        - r_close luôn có tác dụng rõ ràng
+        - Agent học hover tại waypoint, tự nhiên hover tại goal
+          khi waypoint trùng goal (lúc dist_to_goal < LOOKAHEAD)
         """
         s       = self._getDroneStateVector(0)
         pos     = s[0:3]
@@ -178,36 +196,36 @@ class Stage2NavAviary(BaseRLAviary):
         vel     = s[10:13]
         ang_vel = s[13:16]
 
-        dist  = float(np.linalg.norm(self.TARGET_POS - pos))
-        speed = float(np.linalg.norm(vel))
+        waypoint = self.planner.waypoint
+        if waypoint is None:
+            waypoint = self.TARGET_POS
 
-        # ── Tầng 1: Navigation (linear, luôn có gradient dù ở xa) ────────────
-        w_nav = 8.0
-        r_nav = -dist                           # ∈ (-∞, 0]
+        dist_wp = float(np.linalg.norm(waypoint - pos))
+        speed   = float(np.linalg.norm(vel))
 
-        # ── Tầng 2: Close bonus (exponential, mạnh khi dist < 0.3m) ──────────
-        w_close = 10.0
-        r_close = np.exp(-dist * 10.0)          # ∈ [0, 1]
+        # Tầng 1: Navigation đến waypoint
+        w_nav = 4.5
+        r_nav = -dist_wp
 
-        # ── Tầng 3: Velocity penalty (scale theo proximity) ───────────────────
-        # proximity_factor ≈ 1 khi gần, ≈ 0 khi xa
-        # Khi xa: agent được phép bay nhanh để tiếp cận
-        # Khi gần: agent bị phạt nặng nếu còn đang bay nhanh
-        w_vel = 3.0
-        proximity_factor = np.exp(-dist * 3.0)  # ∈ [0, 1]
-        r_vel = -speed * proximity_factor        # ∈ (-∞, 0]
+        # Tầng 2: Close bonus khi gần waypoint
+        w_close = 8.0
+        r_close = np.exp(-dist_wp * 10.0)
 
-        # ── Tầng 4: Attitude penalty ──────────────────────────────────────────
-        w_att = 1.5
-        r_att = -float(np.linalg.norm(rpy[:2]))  # roll + pitch, ∈ (-π, 0]
+        # Tầng 3: Velocity penalty scale theo proximity đến waypoint
+        w_vel            = 4.2
+        r_vel            = -speed
 
-        # ── Tầng 5: Action smoothness ─────────────────────────────────────────
+        # Tầng 4: Attitude penalty
+        w_att = 2.0
+        r_att = -float(np.linalg.norm(rpy[:2]))
+
+        # Tầng 5: Action smoothness
         w_act = 0.3
-        r_act = -float(np.linalg.norm(self._last_action))  # ∈ (-∞, 0]
+        r_act = -float(np.linalg.norm(self._last_action))
 
-        # ── Tầng 6: Angular velocity ──────────────────────────────────────────
-        w_angvel = 0.2
-        r_angvel = -float(np.linalg.norm(ang_vel))  # ∈ (-∞, 0]
+        # Tầng 6: Angular velocity
+        w_angvel = 0.5
+        r_angvel = -float(np.linalg.norm(ang_vel))
 
         total = (w_nav    * r_nav    +
                  w_close  * r_close  +
@@ -225,12 +243,13 @@ class Stage2NavAviary(BaseRLAviary):
         pos = s[0:3]
         rpy = s[7:10]
 
+        # Nới rộng bounds vì goal có thể ở bất kỳ đâu trong GOAL_RANGE
         out_of_bounds = (
-            pos[2] < 0.05 or pos[2] > 3.5
-            or abs(pos[0]) > 4.0
-            or abs(pos[1]) > 4.0
+            pos[2] < 0.05 or pos[2] > 4.0
+            or abs(pos[0]) > 5.0
+            or abs(pos[1]) > 5.0
         )
-        crash = abs(rpy[0]) > 1.3 or abs(rpy[1]) > 1.3  # ~75 độ
+        crash = abs(rpy[0]) > 1.3 or abs(rpy[1]) > 1.3
 
         return bool(out_of_bounds or crash)
 
@@ -239,27 +258,45 @@ class Stage2NavAviary(BaseRLAviary):
         return self._step_n >= self.MAX_STEPS
 
     def _computeInfo(self):
-        s    = self._getDroneStateVector(0)
-        pos  = s[0:3]
-        rpy  = s[7:10]
-        vel  = s[10:13]
-        dist = float(np.linalg.norm(self.TARGET_POS - pos))
- 
-        # is_crashed: kết thúc do out-of-bounds hoặc lật (terminated=True)
+        s   = self._getDroneStateVector(0)
+        pos = s[0:3]
+        rpy = s[7:10]
+        vel = s[10:13]
+
+        waypoint = self.planner.waypoint
+        if waypoint is None:
+            waypoint = self.TARGET_POS
+
+        dist_wp   = float(np.linalg.norm(waypoint - pos))
+        dist_goal = float(np.linalg.norm(self.TARGET_POS - pos))
+        speed     = float(np.linalg.norm(vel))
+
         out_of_bounds = (
-            pos[2] < 0.05 or pos[2] > 3.5
-            or abs(pos[0]) > 4.0
-            or abs(pos[1]) > 4.0
+            pos[2] < 0.05 or pos[2] > 4.0
+            or abs(pos[0]) > 5.0 or abs(pos[1]) > 5.0
         )
         flipped    = abs(rpy[0]) > 1.3 or abs(rpy[1]) > 1.3
         is_crashed = bool(out_of_bounds or flipped)
- 
-        # is_timeout: episode đã đủ MAX_STEPS (truncated=True)
         is_timeout = self._step_n >= self.MAX_STEPS
- 
+
         return {
-            "dist":       dist,
-            "speed":      float(np.linalg.norm(vel)),
-            "is_crashed": is_crashed,   # callback dùng để tính crash_rate
-            "is_timeout": is_timeout,   # callback dùng để tính timeout_rate
+            "dist":       dist_wp,               # curriculum callback dùng cái này
+            "dist_goal":  dist_goal,             # khoảng cách thực đến goal
+            "speed":      speed,
+            "is_crashed": is_crashed,
+            "is_timeout": is_timeout,
+            "at_goal":    self.planner.is_at_goal(pos),
         }
+
+    # ── Dynamic Goal API ──────────────────────────────────────────────────────
+
+    def set_new_goal(self, new_goal: np.ndarray):
+        """
+        Đặt goal mới giữa episode — dynamic goal.
+        Planner tự điều chỉnh waypoint từ bước tiếp theo.
+
+        Ví dụ:
+            env.set_new_goal(np.array([1.0, 2.0, 1.5]))
+        """
+        self.TARGET_POS = np.array(new_goal, dtype=np.float64)
+        self.planner.set_goal(self.TARGET_POS)

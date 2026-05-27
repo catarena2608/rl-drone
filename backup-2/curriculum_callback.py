@@ -48,7 +48,6 @@ class CurriculumCallback(BaseCallback):
         self._ep_dists   = []   # mean dist của các episode đã xong
         self._ep_speeds  = []   # mean speed của các episode đã xong
         self._cur_dists  = []   # tích lũy bước hiện tại
-        self._cur_speeds = []
 
     def _on_step(self) -> bool:
         info = self.locals["infos"][0]

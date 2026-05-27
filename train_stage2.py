@@ -24,8 +24,8 @@ from stable_baselines3.common.callbacks import (
 )
 
 # Import môi trường và bộ giám sát độ khó
-from backup.nav_aviary import Stage2NavAviary
-from backup.curriculum_callback import CurriculumCallback
+from nav_aviary import Stage2NavAviary
+from curriculum_callback import CurriculumCallback
 
 # Cấu hình đường dẫn lưu trữ dữ liệu huấn luyện của Stage 2
 LOG_DIR = "./logs/stage2"
@@ -192,7 +192,7 @@ def train_stage2(args):
         model = PPO.load(
             load_path,
             env=env,
-            device="cpu"  # Giữ nguyên chạy trên CPU theo cấu hình gốc của bạn
+            device="cuda" if torch.cuda.is_available() else "cpu"  # Giữ nguyên chạy trên CPU theo cấu hình gốc của bạn
         )
         
         # Đồng bộ đường dẫn log cũ cho Tensorboard
@@ -210,7 +210,7 @@ def train_stage2(args):
         )
         
         lr_schedule = lambda progress_remaining: 3e-5 + (3e-4 - 3e-5) * progress_remaining
-
+        
         model = PPO(
             "MlpPolicy",
             env,
@@ -225,7 +225,7 @@ def train_stage2(args):
             policy_kwargs=policy_kwargs,
             tensorboard_log=os.path.join(LOG_DIR, "tb"),
             verbose=1,
-            device="cpu",
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
     print(f"Thiết bị: {model.device}")

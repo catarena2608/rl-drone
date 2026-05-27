@@ -64,10 +64,6 @@ class Stage2NavAviary(BaseRLAviary):
         self._last_action = np.zeros(4)
         self._prev_action = np.zeros(4)
 
-        # max_speed từ URDF: 30 km/h = 8.333 m/s
-        # Dùng để normalize speed trong observation
-        self.MAX_SPEED_MS = 30.0 / 3.6  # 8.333 m/s
-
         if initial_xyzs is None:
             offset = np.random.uniform(-0.1, 0.1, size=(1, 3))
             offset[0, 2] = np.random.uniform(-0.05, 0.05)
@@ -112,12 +108,11 @@ class Stage2NavAviary(BaseRLAviary):
             [9:12]  ang_vel      — p, q, r
             [12:15] rel_target   — vector đến target
             [15]    dist         — khoảng cách scalar
-            [16]    speed_norm   — THÊM: speed / max_speed ∈ [0, ~1]
             [17:20] last_act_rpy — 3 motor cuối action trước
         """
         return spaces.Box(
-            low  = np.full(20, -np.inf, dtype=np.float32),
-            high = np.full(20,  np.inf, dtype=np.float32),
+            low  = np.full(19, -np.inf, dtype=np.float32),
+            high = np.full(19,  np.inf, dtype=np.float32),
             dtype=np.float32
         )
 
@@ -130,13 +125,6 @@ class Stage2NavAviary(BaseRLAviary):
 
         rel_target = self.TARGET_POS - pos
         dist       = np.linalg.norm(rel_target)
-        speed      = np.linalg.norm(vel)
-
-        # FIX VẤN ĐỀ 3: normalize speed để agent biết % tốc độ tối đa
-        # Khi speed = 8.3 m/s (max), speed_norm = 1.0
-        # Khi hover yên, speed_norm ≈ 0.0
-        # Agent dùng thông tin này để học phanh sớm khi spawn xa
-        speed_norm = np.array([speed / self.MAX_SPEED_MS], dtype=np.float32)
 
         last_act_rpy = self._last_action.flatten()[1:]  # 3 motor cuối
 
@@ -147,7 +135,6 @@ class Stage2NavAviary(BaseRLAviary):
             ang_vel,       # (3,)
             rel_target,    # (3,)
             [dist],        # (1,)
-            speed_norm,    # (1,) — THÊM MỚI
             last_act_rpy,  # (3,)
         ]).astype(np.float32)  # tổng 20 chiều
 
