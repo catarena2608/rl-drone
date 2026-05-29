@@ -62,10 +62,8 @@ class CurriculumCallback(BaseCallback):
 
         if upgrade_conditions and env.spawn_radius < 2.0:
             env.spawn_radius = min(env.spawn_radius + 0.1, 2.0)
-            
             # ĐỒNG BỘ: Ghi ngay lập tức bán kính mới vào file text để lần sau resume không bị mất
             env.save_spawn_radius() 
-            
             print(f"\n{'='*60}")
             print(f"[CURRICULUM UPGRADE] ✅")
             print(f"  Mean Reward    : {mean_reward:.1f}")
