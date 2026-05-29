@@ -69,6 +69,19 @@ Huấn luyện Drone di chuyển đến các đích ngẫu nhiên trong không g
   python train_stage2.py --eval --gui
   ```
 
+### Theo dõi quá trình huấn luyện (TensorBoard)
+Bạn có thể theo dõi trực quan các chỉ số như `reward`, `loss`, `episode length` qua TensorBoard:
+
+- **Bật TensorBoard cho Stage 1:**
+  ```bash
+  tensorboard --logdir ./logs/stage1/tb
+  ```
+- **Bật TensorBoard cho Stage 2:**
+  ```bash
+  tensorboard --logdir ./logs/stage2/tb
+  ```
+Sau đó truy cập địa chỉ: `http://localhost:6006/` trên trình duyệt.
+
 ## 📊 Kiến trúc Mạng thần kinh (Neural Network)
 
 Theo đặc tả thực nghiệm, cả Actor và Critic đều sử dụng mạng MLP sâu:
