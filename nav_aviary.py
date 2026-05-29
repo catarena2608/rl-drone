@@ -58,6 +58,14 @@ def _load_spawn_radius(default: float = 0.1) -> float:
         except ValueError:
             pass
     return default
+def save_spawn_radius(self):
+        """Đồng bộ bán kính spawn hiện tại trong RAM vào file vật lý text."""
+        try:
+            # Bạn thay "spawn_radius.txt" bằng đường dẫn file chính xác của bạn nếu cần
+            with open("spawn_radius.txt", "w") as f:
+                f.write(str(self.spawn_radius))
+        except Exception as e:
+            print(f"Lỗi khi lưu spawn_radius.txt: {e}")
 
 
 class Stage2NavAviary(BaseRLAviary):

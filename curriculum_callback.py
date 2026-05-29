@@ -35,76 +35,57 @@ class CurriculumCallback(BaseCallback):
         else:
             env = self.training_env.unwrapped
 
+        # Phải có ít nhất một vài episodes hoàn thành trong buffer để tính toán toán học
         if len(self.model.ep_info_buffer) == 0:
             return True
 
-        # ── Lấy metrics từ buffer ──────────────────────────────────────────────
-        mean_reward = np.mean([ep['r'] for ep in self.model.ep_info_buffer])
-        mean_length = np.mean([ep['l'] for ep in self.model.ep_info_buffer])
+        # 1. Thu thập dữ liệu thống kê trung bình thực tế từ lịch sử các tập đã qua
+        # Stable-baselines3 tự động lưu 'r' (reward) và 'l' (length) trong ep_info_buffer
+        mean_reward = np.mean([ep_info["r"] for ep_info in self.model.ep_info_buffer])
+        mean_length = np.mean([ep_info["l"] for ep_info in self.model.ep_info_buffer])
 
-        # Lấy state hiện tại để đánh giá chất lượng hover
-        state = env._getDroneStateVector(0)
-        pos   = state[0:3]
-        vel   = state[10:13]
+        # Trích xuất 'dist' và 'speed' trung bình (được đẩy từ hàm _computeInfo của nav_aviary vào)
+        # Nếu tập đầu chưa kịp ghi nhận thì fallback về giá trị an toàn
+        mean_dist = np.mean([ep_info.get("dist", 0.5) for ep_info in self.model.ep_info_buffer])
+        mean_speed = np.mean([ep_info.get("speed", 0.5) for ep_info in self.model.ep_info_buffer])
 
-        current_dist  = float(np.linalg.norm(pos - env.TARGET_POS))
-        current_speed = float(np.linalg.norm(vel))
+        old_radius = env.spawn_radius
 
-        # ── UPGRADE: Tăng radius khi policy đủ tốt ────────────────────────────
-        #
-        # Điều kiện upgrade được thiết kế chặt hơn phiên bản cũ:
-        #   1. mean_reward > ngưỡng reward mới (reward function đã thay đổi scale)
-        #   2. mean_length > 1500: agent sống đủ lâu, không crash sớm
-        #   3. current_dist < 0.15: agent đang ở gần target
-        #   4. current_speed < 0.1: agent đang hover yên, không chỉ bay qua
-        #
-        # Lý do thêm điều kiện speed:
-        #   Phiên bản cũ chỉ check dist — agent có thể đạt dist < 0.1
-        #   nhưng vẫn đang bay nhanh qua target (overshoot).
-        #   Nếu upgrade lúc này, agent sẽ fail ở radius lớn hơn.
-        #
-        # Ngưỡng reward mới (~-2.0 đến 0.0 khi hover tốt):
-        #   dist=0.05, speed=0.02 → reward ≈ -0.4 + 6.07 - 0.06 - ... ≈ 4.5/step
-        #   × 2000 steps ≈ 9000 tổng (nhưng ep_info_buffer lưu cumulative)
-        #   Dùng mean_reward > -500 là ngưỡng thực tế hợp lý
-        #
+        # 2. Định nghĩa điều kiện nâng cấp (UPGRADE) chuẩn xác bằng giá trị TRUNG BÌNH
+        # Thay thế current_dist/current_speed bằng mean_dist/mean_speed
         upgrade_conditions = (
-            mean_reward > -500         # reward tích lũy đủ tốt
-            and mean_length > 1500     # agent sống đủ lâu
-            and current_dist  < 0.15  # đang ở gần target
-            and current_speed < 0.15  # đang hover yên (THÊM MỚI)
-            and env.spawn_radius < 2.0
+            mean_reward > 3000          # Ngưỡng reward tùy bạn cấu hình
+            and mean_length > 1500      # Sống sót lâu (chứng tỏ hover tốt không crash)
+            and mean_dist < 0.15        # Khoảng cách trung bình tới target sát sạt
+            and mean_speed < 0.15       # Tốc độ trung bình khi tiếp cận phải cực kỳ chậm (phanh chuẩn)
         )
 
-        if upgrade_conditions:
-            old_radius = env.spawn_radius
-            # Bước tăng nhỏ hơn (0.1 thay vì 0.15) để curriculum mượt ở vùng > 0.8m
+        if upgrade_conditions and env.spawn_radius < 2.0:
             env.spawn_radius = min(env.spawn_radius + 0.1, 2.0)
+            
+            # ĐỒNG BỘ: Ghi ngay lập tức bán kính mới vào file text để lần sau resume không bị mất
+            env.save_spawn_radius() 
+            
             print(f"\n{'='*60}")
             print(f"[CURRICULUM UPGRADE] ✅")
-            print(f"  Mean Reward : {mean_reward:.1f}")
-            print(f"  Mean Length : {mean_length:.1f} steps")
-            print(f"  Dist to target  : {current_dist:.3f} m")
-            print(f"  Current speed   : {current_speed:.3f} m/s")
-            print(f"  Spawn radius    : {old_radius:.2f} → {env.spawn_radius:.2f} m")
+            print(f"  Mean Reward    : {mean_reward:.1f}")
+            print(f"  Mean Length    : {mean_length:.1f} steps")
+            print(f"  Mean Target Dist: {mean_dist:.3f} m")
+            print(f"  Mean Speed     : {mean_speed:.3f} m/s")
+            print(f"  Spawn radius   : {old_radius:.2f} → {env.spawn_radius:.2f} m")
             print(f"{'='*60}\n")
 
-        # ── DOWNGRADE: Giảm radius khi agent fail ─────────────────────────────
-        #
-        # Ngưỡng downgrade cũng thay đổi theo reward scale mới.
-        # Dùng mean_length < 500 thay vì chỉ dùng reward:
-        #   Nếu agent crash thường xuyên → mean_length sẽ thấp
-        #   Đây là signal rõ ràng hơn reward vì reward có thể âm lớn
-        #   chỉ vì agent ở xa target, không nhất thiết vì nó kém.
-        #
-        elif (mean_length < 500 and env.spawn_radius > 0.15):
-            old_radius = env.spawn_radius
+        # 3. Định nghĩa điều kiện giảm cấp (DOWNGRADE)
+        elif mean_length < 500 and env.spawn_radius > 0.15:
             env.spawn_radius = max(env.spawn_radius - 0.1, 0.1)
+            
+            # ĐỒNG BỘ: Ghi lại file khi hạ độ khó
+            env.save_spawn_radius()
+            
             print(f"\n{'='*60}")
             print(f"[CURRICULUM DOWNGRADE] ⚠️")
-            print(f"  Mean Reward : {mean_reward:.1f}")
-            print(f"  Mean Length : {mean_length:.1f} steps  ← crash thường xuyên")
-            print(f"  Spawn radius    : {old_radius:.2f} → {env.spawn_radius:.2f} m")
+            print(f"  Mean Length    : {mean_length:.1f} steps (Agent crash quá nhiều!)")
+            print(f"  Spawn radius   : {old_radius:.2f} → {env.spawn_radius:.2f} m")
             print(f"{'='*60}\n")
 
         return True
